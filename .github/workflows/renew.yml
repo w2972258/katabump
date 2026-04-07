@@ -2,43 +2,54 @@ name: Katabump Auto Renew
 
 on:
   schedule:
-    # 每天 UTC 0点 (北京时间 8点) 运行
-    - cron: '13 0 * * *'
-  workflow_dispatch: # 允许手动触发
+    - cron: '13 0 * * *'        # 每天 UTC 00:13（北京时间 08:13）
+  workflow_dispatch:              # 允许手动触发
 
 jobs:
   renew:
     runs-on: ubuntu-latest
-    
     steps:
-    - uses: actions/checkout@v4
-    
-    - name: Setup Node.js
-      uses: actions/setup-node@v4
-      with:
-        node-version: '20'
-        
-    - name: Install Dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y xvfb
-        npm install
-        npx playwright install-deps chrome
-      
-    - name: Run Renew Script
-      env:
-        # 将 USERS_JSON 配置在 GitHub Repository Secrets 中
-        # 格式: [{"username": "xxx", "password": "xxx"}, ...]
-        USERS_JSON: ${{ secrets.USERS_JSON }}
-        HTTP_PROXY: ${{ secrets.HTTP_PROXY }}
-        TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
-        TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-      # 使用 xvfb-run 模拟有头环境运行
-      run: xvfb-run --auto-servernum --server-args="-screen 0 1280x720x24" node action_renew.js
+      - uses: actions/checkout@v4
 
-    - name: Upload Screenshots
-      if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: screenshots
-        path: screenshots/
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb
+          npm install
+          npx playwright install-deps chrome
+
+      - name: Run Renew Script
+        env:
+          USERS_JSON: ${{ secrets.USERS_JSON }}
+          HTTP_PROXY: ${{ secrets.HTTP_PROXY }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: xvfb-run --auto-servernum --server-args="-screen 0 1280x720x24" node action_renew.js
+
+      - name: Upload Screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots
+          path: screenshots/
+
+      - name: Notify on Failure
+        if: failure()
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TG_BOT_TOKEN }}/sendMessage" \
+            -d chat_id="${{ secrets.TG_CHAT_ID }}" \
+            -d text="❌ Katabump 续期失败，请检查 Actions 日志"
+
+  keepalive:
+    name: Keepalive Workflow
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: gautamkrishnar/keepalive-workflow@v2
