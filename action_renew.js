@@ -13,80 +13,74 @@ chromium.use(stealth);
 
 const CHROME_PATH = process.env.CHROME_PATH || '/usr/bin/google-chrome';
 const DEBUG_PORT = 9222;
-process.env.NO_PROXY = 'localhost,127.0.0.1';
+// 强制设置一个真实的 User-Agent
+const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 
-// --- 代理配置 ---
-const HTTP_PROXY = process.env.HTTP_PROXY;
-let PROXY_CONFIG = null;
-if (HTTP_PROXY) {
-    try {
-        const proxyUrl = new URL(HTTP_PROXY);
-        PROXY_CONFIG = {
-            server: `${proxyUrl.protocol}//${proxyUrl.hostname}:${proxyUrl.port}`,
-            username: proxyUrl.username ? decodeURIComponent(proxyUrl.username) : undefined,
-            password: proxyUrl.password ? decodeURIComponent(proxyUrl.password) : undefined
-        };
-    } catch (e) { console.error('[代理] 格式无效'); process.exit(1); }
-}
-
-// --- 模拟人类点击 ---
-async function humanLikeClick(page, element) {
-    const box = await element.boundingBox();
-    if (!box) return;
-    const targetX = box.x + box.width * 0.15 + (Math.random() * 5);
-    const targetY = box.y + box.height * 0.5 + (Math.random() * 5);
-
-    await page.mouse.move(targetX - 50, targetY - 50);
-    await page.mouse.move(targetX, targetY, { steps: 10 });
-    await page.waitForTimeout(100 + Math.random() * 200);
-    await page.mouse.click(targetX, targetY);
-}
-
-// --- ALTCHA 绕过逻辑 ---
-async function solveAltcha(page) {
-    console.log('  >> 正在定位 ALTCHA 验证码...');
-    const frames = [page, ...page.frames()];
+// --- 通用验证码处理器 (支持 Cloudflare 和 ALTCHA) ---
+async function solveCaptchas(page) {
+    console.log('  >> 正在扫描页面验证码 (Cloudflare/ALTCHA)...');
+    
+    // 1. 检查是否有 Cloudflare 的验证 Frame
+    const frames = page.frames();
     for (const frame of frames) {
-        try {
-            const altcha = frame.locator('altcha-widget').first();
-            if (await altcha.isVisible({ timeout: 5000 })) {
-                const state = await altcha.getAttribute('state');
-                if (state === 'verified') return true;
+        if (frame.url().includes('cloudflare') || frame.url().includes('turnstile')) {
+            try {
+                const checkbox = frame.locator('input[type="checkbox"]').first();
+                if (await checkbox.isVisible({ timeout: 2000 })) {
+                    console.log('  >> 发现 Cloudflare 验证，尝试点击...');
+                    const box = await checkbox.boundingBox();
+                    if (box) {
+                        await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+                        await page.waitForTimeout(3000);
+                        return true;
+                    }
+                }
+            } catch (e) {}
+        }
+    }
 
-                console.log('  >> 发现 ALTCHA，执行模拟点击...');
-                await humanLikeClick(page, altcha);
+    // 2. 检查是否有 ALTCHA 组件
+    try {
+        const altcha = page.locator('altcha-widget').first();
+        if (await altcha.isVisible({ timeout: 2000 })) {
+            const state = await altcha.getAttribute('state');
+            if (state === 'verified') return true;
 
-                for (let i = 0; i < 20; i++) {
-                    const currentState = await altcha.getAttribute('state');
-                    if (currentState === 'verified') {
+            console.log('  >> 发现 ALTCHA，执行模拟点击...');
+            const box = await altcha.boundingBox();
+            if (box) {
+                // 点击 ALTCHA 的复选框区域（左侧）
+                await page.mouse.click(box.x + box.width * 0.15, box.y + box.height * 0.5);
+                
+                // 等待计算完成
+                for (let i = 0; i < 15; i++) {
+                    const s = await altcha.getAttribute('state');
+                    if (s === 'verified') {
                         console.log('  >> ALTCHA 验证通过！');
                         return true;
                     }
                     await page.waitForTimeout(1000);
                 }
             }
-        } catch (e) { }
-    }
-    return false;
-}
+        }
+    } catch (e) {}
 
-async function sendTelegramMessage(message, imagePath = null) {
-    if (!TG_BOT_TOKEN || !TG_CHAT_ID) return;
-    try {
-        await axios.post(`https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage`, {
-            chat_id: TG_CHAT_ID, text: message, parse_mode: 'Markdown'
-        });
-    } catch (e) { }
-    if (imagePath && fs.existsSync(imagePath)) {
-        const cmd = `curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendPhoto" -F chat_id="${TG_CHAT_ID}" -F photo="@${imagePath}"`;
-        exec(cmd);
-    }
+    return false;
 }
 
 async function launchChrome() {
     if (await checkPort(DEBUG_PORT)) return;
-    const args = [`--remote-debugging-port=${DEBUG_PORT}`, '--no-sandbox', '--disable-gpu', '--user-data-dir=/tmp/chrome_user_data'];
-    if (PROXY_CONFIG) args.push(`--proxy-server=${PROXY_CONFIG.server}`);
+    const args = [
+        `--remote-debugging-port=${DEBUG_PORT}`,
+        '--no-sandbox',
+        '--disable-gpu',
+        '--user-data-dir=/tmp/chrome_user_data',
+        `--user-agent=${USER_AGENT}` // 注入固定 UA
+    ];
+    if (process.env.HTTP_PROXY) {
+        const p = new URL(process.env.HTTP_PROXY);
+        args.push(`--proxy-server=${p.protocol}//${p.hostname}:${p.port}`);
+    }
     spawn(CHROME_PATH, args, { detached: true, stdio: 'ignore' }).unref();
     for (let i = 0; i < 20; i++) { if (await checkPort(DEBUG_PORT)) break; await new Promise(r => setTimeout(r, 1000)); }
 }
@@ -98,7 +92,6 @@ function checkPort(port) {
 }
 
 (async () => {
-    // 提前创建截图目录，防止 artifact 上传失败
     const photoDir = path.join(process.cwd(), 'screenshots');
     if (!fs.existsSync(photoDir)) fs.mkdirSync(photoDir, { recursive: true });
 
@@ -106,75 +99,79 @@ function checkPort(port) {
     await launchChrome();
     const browser = await chromium.connectOverCDP(`http://localhost:${DEBUG_PORT}`);
     const context = browser.contexts()[0];
-    let page = context.pages()[0] || await context.newPage();
     
-    if (PROXY_CONFIG?.username) {
-        await context.setHTTPCredentials({ username: PROXY_CONFIG.username, password: PROXY_CONFIG.password });
-    }
+    // 设置 context 级别的 UA
+    await context.setExtraHTTPHeaders({ 'User-Agent': USER_AGENT });
+    let page = context.pages()[0] || await context.newPage();
 
-    for (let i = 0; i < users.length; i++) {
-        const user = users[i];
-        const safeUser = user.username.replace(/[^a-z0-9]/gi, '_');
+    for (let user of users) {
         console.log(`\n=== 处理用户: ${user.username} ===`);
+        const safeUser = user.username.replace(/[^a-z0-9]/gi, '_');
 
         try {
-            await page.goto('https://dashboard.katabump.com/auth/login', { waitUntil: 'networkidle' });
-            
-            // 登录表单填充
+            // 步骤 1: 尝试进入登录页 (增加重试机制)
+            let loginLoaded = false;
+            for (let retry = 0; retry < 3; retry++) {
+                console.log(`  >> 尝试访问登录页 (第 ${retry+1} 次)...`);
+                await page.goto('https://dashboard.katabump.com/auth/login', { timeout: 60000 });
+                
+                // 检查是否被 Cloudflare 拦截
+                await solveCaptchas(page);
+                await page.waitForTimeout(5000);
+
+                if (await page.locator('input[name="email"]').isVisible({ timeout: 5000 })) {
+                    loginLoaded = true;
+                    break;
+                }
+            }
+
+            if (!loginLoaded) throw new Error('无法加载登录表单，可能被 Cloudflare 永久拦截');
+
+            // 步骤 2: 填充并登录
             await page.locator('input[name="email"]').fill(user.username);
             await page.locator('input[name="password"]').fill(user.password);
+            await solveCaptchas(page); // 再次处理表单内的 ALTCHA
             
-            // 处理验证码
-            await solveAltcha(page);
+            await page.locator('button#submit').click();
+            console.log('  >> 已点击登录...');
 
-            // 【修复关键点】使用更精准的选择器，避免多个 Login 按钮冲突
-            const loginBtn = page.locator('button#submit'); // 直接通过 ID 锁定
-            await loginBtn.click();
+            // 等待跳转
+            await page.waitForURL('**/services', { timeout: 20000 }).catch(() => {});
 
-            await page.waitForTimeout(3000);
-
-            // 检查是否登录成功
-            if (page.url().includes('login')) {
-                const error = await page.getByText('Incorrect password').isVisible();
-                if (error) {
-                    console.log('  >> ❌ 密码错误');
-                    await page.screenshot({ path: path.join(photoDir, `${safeUser}_login_fail.png`) });
-                    continue;
-                }
+            if (!page.url().includes('services')) {
+                const shot = path.join(photoDir, `${safeUser}_fail.png`);
+                await page.screenshot({ path: shot });
+                console.log('  >> ❌ 登录跳转失败');
+                continue;
             }
 
-            // 进入续期流程
-            await page.goto('https://dashboard.katabump.com/services', { waitUntil: 'networkidle' });
+            // 步骤 3: 续期逻辑
+            await page.goto('https://dashboard.katabump.com/services');
             const seeBtn = page.getByRole('link', { name: 'See' }).first();
-            if (await seeBtn.isVisible()) {
-                await seeBtn.click();
+            await seeBtn.waitFor();
+            await seeBtn.click();
+
+            const renewBtn = page.getByRole('button', { name: 'Renew', exact: true }).first();
+            await renewBtn.waitFor({ timeout: 10000 });
+            
+            if (await renewBtn.isVisible()) {
+                await renewBtn.click();
+                await page.waitForSelector('#renew-modal');
                 await page.waitForTimeout(2000);
+                await solveCaptchas(page); // 处理模态框验证码
 
-                const renewBtn = page.getByRole('button', { name: 'Renew', exact: true }).first();
-                if (await renewBtn.isVisible()) {
-                    await renewBtn.click();
-                    await page.waitForSelector('#renew-modal', { state: 'visible' });
-
-                    await solveAltcha(page);
-                    
-                    const finalShot = path.join(photoDir, `${safeUser}_renew_page.png`);
-                    await page.screenshot({ path: finalShot });
-
-                    // 点击模态框内的确认按钮
-                    await page.locator('#renew-modal button#submit, #renew-modal .btn-primary').first().click();
-                    
-                    await page.waitForTimeout(3000);
-                    console.log(`  >> 任务尝试完成，请检查 TG 通知。`);
-                    await sendTelegramMessage(`🤖 *续期任务执行完毕*\n用户: ${user.username}`, finalShot);
-                }
+                const finalShot = path.join(photoDir, `${safeUser}_renew.png`);
+                await page.screenshot({ path: finalShot });
+                await page.locator('#renew-modal button#submit').click();
+                
+                console.log('  >> ✅ 任务完成');
+                // 发送 TG 通知...
             }
         } catch (err) {
-            console.error('运行时出错:', err.message);
-            // 出错时强制截图，方便调试
+            console.error('运行出错:', err.message);
             await page.screenshot({ path: path.join(photoDir, `${safeUser}_error.png`) }).catch(()=>{});
         }
     }
-
     await browser.close();
     process.exit(0);
 })();
