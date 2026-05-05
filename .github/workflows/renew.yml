@@ -8,6 +8,8 @@ on:
 jobs:
   renew:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    
     steps:
       - uses: actions/checkout@v4
 
@@ -15,6 +17,7 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '20'
+          cache: 'npm' # 开启 npm 依赖缓存
 
       - name: Install Dependencies
         run: |
@@ -22,13 +25,15 @@ jobs:
           sudo apt-get install -y xvfb
           npm install
           npx playwright install-deps chrome
-
+          sudo apt-get install -y google-chrome-stable
+          
       - name: Run Renew Script
         env:
           USERS_JSON: ${{ secrets.USERS_JSON }}
           HTTP_PROXY: ${{ secrets.HTTP_PROXY }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          CHROME_PATH: /usr/bin/google-chrome
         run: xvfb-run --auto-servernum --server-args="-screen 0 1280x720x24" node action_renew.js
 
       - name: Upload Screenshots
@@ -37,6 +42,7 @@ jobs:
         with:
           name: screenshots
           path: screenshots/
+          retention-days: 3 # 截图保留3天即可，节省存储空间
 
       - name: Notify on Failure
         if: failure()
