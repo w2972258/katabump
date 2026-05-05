@@ -43,73 +43,62 @@ const INJECTED_SCRIPT = `
 `;
 
 /**
- * 终极验证码处理器：在任何步骤调用，确保页面干净
+ * 强力验证码处理器：专门针对 ALTCHA 做了点击增强
  */
-async function ensureCaptchaSolved(page, stepName) {
-    console.log(`  >> [检查点: ${stepName}] 正在扫描拦截框...`);
+async function forceSolveCaptcha(page, stepName) {
+    console.log(`  >> [${stepName}] 正在强制扫描拦截框...`);
     const startTime = Date.now();
-    const timeout = 40000; // 给足 40 秒处理时间
+    const timeout = 60000; // 增加到 60 秒
 
     while (Date.now() - startTime < timeout) {
-        let foundAnything = false;
-
-        // --- 1. 扫描所有 Frame (针对 Cloudflare) ---
+        // --- 1. 处理 Cloudflare (使用 CDP 模拟点击) ---
         const frames = page.frames();
         for (const frame of frames) {
             try {
-                // 检查 Token
                 const tokenReady = await frame.evaluate(() => {
                     const input = document.querySelector('[name*="turnstile-response"]');
                     return input && input.value.length > 20;
                 }).catch(() => false);
-                if (tokenReady) {
-                    console.log(`  >> [${stepName}] Cloudflare 已通过 (Token 确认)`);
-                    return true;
-                }
+                if (tokenReady) return true;
 
-                // 尝试 CDP 点击
                 const pos = await frame.evaluate(() => window.__captcha_pos).catch(() => null);
                 if (pos) {
                     const fEl = await frame.frameElement();
                     const box = await fEl.boundingBox();
                     if (box) {
-                        console.log(`  >> [${stepName}] 发现 Cloudflare，执行底层点击...`);
                         const client = await page.context().newCDPSession(page);
                         await client.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: box.x + pos.x, y: box.y + pos.y, button: 'left', clickCount: 1 });
                         await client.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: box.x + pos.x, y: box.y + pos.y, button: 'left', clickCount: 1 });
                         await client.detach();
                         await page.waitForTimeout(4000);
-                        foundAnything = true;
                     }
                 }
             } catch (e) {}
         }
 
-        // --- 2. 扫描主页面/模态框 (针对 ALTCHA) ---
+        // --- 2. 处理 ALTCHA (针对第 5 张图的情况强化) ---
         const altcha = page.locator('altcha-widget').first();
-        if (await altcha.isVisible({timeout: 500}).catch(()=>false)) {
+        if (await altcha.isVisible({timeout: 1000}).catch(()=>false)) {
             const state = await altcha.getAttribute('state');
             if (state === 'verified') {
-                console.log(`  >> [${stepName}] ALTCHA 已通过`);
+                console.log(`  >> [${stepName}] ✅ ALTCHA 已通过`);
                 return true;
             }
+            
             if (state !== 'computing') {
-                console.log(`  >> [${stepName}] 发现未激活的 ALTCHA，准备点击...`);
+                console.log(`  >> [${stepName}] 发现未勾选的 ALTCHA，执行强力点击...`);
+                // 尝试多种点击策略：1. 坐标点击 2. 穿透点击内部元素
                 const box = await altcha.boundingBox();
                 if (box) {
+                    // 策略 A: 模拟鼠标点击复选框位置
                     await page.mouse.click(box.x + box.width * 0.15, box.y + box.height * 0.5);
-                    await page.waitForTimeout(3000);
-                    foundAnything = true;
+                    // 策略 B: 尝试直接点击组件（有时组件本身有点击监听）
+                    await altcha.click({ position: { x: 20, y: 25 }, force: true }).catch(()=>{});
                 }
+                await page.waitForTimeout(4000); // 给计算留时间
             } else {
-                console.log(`  >> [${stepName}] ALTCHA 正在计算中...`);
+                console.log(`  >> [${stepName}] ⏳ ALTCHA 正在计算 hash...`);
             }
-        }
-
-        if (!foundAnything && Date.now() - startTime > 5000) {
-            // 如果 5 秒后还没发现任何验证码，假设页面目前是干净的
-            console.log(`  >> [${stepName}] 未发现拦截框，继续流程`);
-            return true;
         }
 
         await page.waitForTimeout(2000);
@@ -127,7 +116,7 @@ async function launchChrome() {
 function checkPort(port) { return new Promise(r => { http.get(`http://localhost:${port}/json/version`, () => r(true)).on('error', () => r(false)).end(); }); }
 
 (async () => {
-    console.log('--- 终极全生命周期拦截版启动 ---');
+    console.log('--- 强力 ALTCHA 适配版启动 ---');
     const users = JSON.parse(process.env.USERS_JSON || '[]');
     await launchChrome();
     const browser = await chromium.connectOverCDP(`http://localhost:${DEBUG_PORT}`);
@@ -137,66 +126,52 @@ function checkPort(port) { return new Promise(r => { http.get(`http://localhost:
 
     for (let user of users) {
         const safeUser = user.username.replace(/[^a-z0-9]/gi, '_');
-        console.log(`\n>>> 正在处理用户: ${user.username}`);
-
         try {
-            // 步骤 1: 登录页
+            // 登录流程
             await page.goto('https://dashboard.katabump.com/auth/login');
-            await ensureCaptchaSolved(page, "登录页加载"); // 进入页面先扫一遍
-            await page.screenshot({ path: path.join(photoDir, `${safeUser}_01_login_page.png`) });
-
+            await forceSolveCaptcha(page, "登录页");
             await page.locator('input[name="email"]').fill(user.username);
             await page.locator('input[name="password"]').fill(user.password);
-            
-            await ensureCaptchaSolved(page, "提交登录前"); // 点击前再确认
-            await page.screenshot({ path: path.join(photoDir, `${safeUser}_02_login_ready.png`) });
-
+            await forceSolveCaptcha(page, "登录前二次确认");
             await page.locator('button#submit').click();
-            await page.waitForTimeout(5000);
 
-            // 步骤 2: Dashboard 确认
+            // 进入后台
             await page.waitForURL(url => !url.href.includes('/auth/'), { timeout: 20000 });
-            console.log('  ✅ 登录成功');
-            await page.screenshot({ path: path.join(photoDir, `${safeUser}_03_dashboard.png`) });
-
-            // 步骤 3: 进入详情页
-            await page.goto('https://dashboard.katabump.com/dashboard'); // 源码显示主页就是详情页入口
+            await page.goto('https://dashboard.katabump.com/dashboard');
+            
+            // 点击 See
             const seeBtn = page.locator('table a:has-text("See"), table a:has-text("Manage"), .btn-outline-primary').first();
             await seeBtn.waitFor({ state: 'visible' });
             await seeBtn.click();
-            
             await page.waitForTimeout(3000);
-            await ensureCaptchaSolved(page, "服务器详情页"); // 详情页可能也有拦截
-            await page.screenshot({ path: path.join(photoDir, `${safeUser}_04_server_detail.png`) });
 
-            // 步骤 4: 触发续期模态框
+            // 续期操作
             const renewBtnTrigger = page.locator('button[data-bs-target="#renew-modal"]');
             if (await renewBtnTrigger.isVisible()) {
                 await renewBtnTrigger.click();
+                // 确保模态框完全显示且动画结束
                 await page.waitForSelector('#renew-modal.show', { timeout: 5000 });
-                console.log('  已打开模态框，等待验证码...');
-                
-                // 步骤 5: 模态框内的死等验证
                 await page.waitForTimeout(2000); 
-                await ensureCaptchaSolved(page, "模态框内部"); 
-                await page.screenshot({ path: path.join(photoDir, `${safeUser}_05_renew_ready_to_click.png`) });
+                
+                // 【核心修复步聚】：强力解决模态框验证
+                await forceSolveCaptcha(page, "模态框内部"); 
+                
+                // 此时截图，确认是否有绿色的勾
+                await page.screenshot({ path: path.join(photoDir, `${safeUser}_05_renew_checked.png`) });
 
-                // 步骤 6: 提交续期
-                console.log('  点击最终续期按钮...');
+                // 提交续期：确保点击的是 Renew 按钮而不是 Close
+                console.log('  正在提交续期表单...');
                 await page.locator('#renew-modal button[type="submit"]').click();
                 
                 await page.waitForTimeout(6000);
                 await page.screenshot({ path: path.join(photoDir, `${safeUser}_06_final_result.png`) });
-                console.log('  ✅ 续期全流程已结束');
 
                 if (TG_BOT_TOKEN) {
-                    exec(`curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendPhoto" -F chat_id="${TG_CHAT_ID}" -F photo="@${path.join(photoDir, `${safeUser}_06_final_result.png`)}" -F caption="🤖 ${user.username} 续期任务结果汇报"`);
+                    exec(`curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendPhoto" -F chat_id="${TG_CHAT_ID}" -F photo="@${path.join(photoDir, `${safeUser}_06_final_result.png`)}" -F caption="🤖 ${user.username} 续期执行报告"`);
                 }
-            } else {
-                console.log('  ℹ️ 状态: 暂无需续期');
             }
         } catch (err) {
-            console.error(`  异常报告: ${err.message}`);
+            console.error(`  异常: ${err.message}`);
             await page.screenshot({ path: path.join(photoDir, `${safeUser}_99_error.png`) }).catch(()=>{});
         }
     }
